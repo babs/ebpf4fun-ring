@@ -1,0 +1,28 @@
+# Generated files
+dnscapture*_bpfe*.*o
+__debug_bin*
+
+misc/*
+build-run.sh
+
+# Binary
+dns-capture
+dns-capture_unix
+
+# Go build cache
+.cache/
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+
+# Temporary files
+*.tmp
+*.temp
