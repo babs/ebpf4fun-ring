@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -52,14 +54,16 @@ type DNSEvent struct {
 
 // DNSProcessor handles DNS packet processing
 type DNSProcessor struct {
-	xdpCollection   *ebpf.Collection
-	tcCollection    *ebpf.Collection
-	xdpReader       *ringbuf.Reader
-	tcReader        *ringbuf.Reader
-	xdpLink         link.Link
-	tcLink          link.Link
-	timestampOffset int64  // Offset to convert eBPF boot-time to Unix time
-	tcIfaceName     string // Store the interface name for TC qdisc cleanup
+	xdpCollection    *ebpf.Collection
+	tcCollection     *ebpf.Collection
+	xdpReader        *ringbuf.Reader
+	tcReader         *ringbuf.Reader
+	xdpLink          link.Link
+	tcLinks          map[string]link.Link // Map of interface name to TC link
+	timestampOffset  int64                // Offset to convert eBPF boot-time to Unix time
+	attachedIfaces   map[string]bool      // Track attached interfaces
+	interfaceUpdates chan string          // Channel for interface updates
+	ifacePattern     *regexp.Regexp       // Regex pattern for interface filtering
 }
 
 // getSystemUptime reads the system uptime from /proc/uptime
@@ -89,26 +93,76 @@ func intToIP(ip uint32) net.IP {
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		log.Fatal("Usage: ./dns-capture <interface_name>")
+	var ifacePattern = flag.String("pattern", "", "Regex pattern to filter interfaces (e.g., 'eth.*|wlan.*')")
+	flag.Parse()
+
+	var ifaceNames []string
+	var pattern *regexp.Regexp
+	var err error
+
+	// Compile regex pattern if provided
+	if *ifacePattern != "" {
+		pattern, err = regexp.Compile(*ifacePattern)
+		if err != nil {
+			log.Fatalf("Invalid regex pattern: %v", err)
+		}
 	}
 
-	ifaceName := os.Args[1]
+	// Check for positional interface arguments
+	args := flag.Args()
+	if len(args) > 0 {
+		// Specific interfaces provided
+		ifaceNames = args
+	} else {
+		// No interface specified, get all interfaces (optionally filtered by pattern)
+		interfaces, err := net.Interfaces()
+		if err != nil {
+			log.Fatalf("Failed to get network interfaces: %v", err)
+		}
+
+		for _, iface := range interfaces {
+			// Skip loopback and down interfaces
+			if iface.Flags&net.FlagLoopback == 0 && iface.Flags&net.FlagUp != 0 {
+				// Apply pattern filter if specified
+				if pattern == nil || pattern.MatchString(iface.Name) {
+					ifaceNames = append(ifaceNames, iface.Name)
+				}
+			}
+		}
+
+		if len(ifaceNames) == 0 {
+			if pattern != nil {
+				log.Fatalf("No interfaces found matching pattern '%s'", *ifacePattern)
+			} else {
+				log.Fatal("No suitable network interfaces found")
+			}
+		}
+
+		if pattern != nil {
+			log.Printf("Monitoring interfaces matching pattern '%s': %v", *ifacePattern, ifaceNames)
+		} else {
+			log.Printf("No interface specified, monitoring all interfaces: %v", ifaceNames)
+		}
+	}
 
 	// Create DNS processor
-	processor, err := NewDNSProcessor()
+	processor, err := NewDNSProcessor(pattern)
 	if err != nil {
 		log.Fatalf("Failed to create DNS processor: %v", err)
 	}
 	defer processor.Close()
 
-	// if err := processor.AttachXDP(ifaceName); err != nil {
-	// 	log.Fatalf("Failed to attach TC program: %v", err)
-	// }
-
-	if err := processor.AttachTC(ifaceName); err != nil {
-		log.Fatalf("Failed to attach TC program: %v", err)
+	// Attach to all specified interfaces
+	for _, ifaceName := range ifaceNames {
+		if err := processor.AttachTC(ifaceName); err != nil {
+			log.Printf("Failed to attach to interface %s: %v", ifaceName, err)
+			continue
+		}
+		log.Printf("Attached to interface: %s", ifaceName)
 	}
+
+	// Start interface monitoring for hot additions
+	go processor.MonitorInterfaces()
 
 	// Create context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -125,7 +179,7 @@ func main() {
 	}()
 
 	// Start processing events
-	fmt.Printf("Capturing DNS traffic on interface %s...\n", ifaceName)
+	fmt.Printf("Capturing DNS traffic on interfaces: %v\n", ifaceNames)
 	fmt.Println("Press Ctrl+C to stop")
 	fmt.Println(strings.Repeat("=", 80))
 

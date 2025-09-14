@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -21,7 +22,7 @@ import (
 )
 
 // NewDNSProcessor creates a new DNS processor
-func NewDNSProcessor() (*DNSProcessor, error) {
+func NewDNSProcessor(pattern *regexp.Regexp) (*DNSProcessor, error) {
 	// Remove memory limit for eBPF
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return nil, fmt.Errorf("failed to remove memory limit: %v", err)
@@ -84,8 +85,12 @@ func NewDNSProcessor() (*DNSProcessor, error) {
 		//	xdpCollection:   xdpCollection,
 		tcCollection: tcCollection,
 		// xdpReader:       xdpReader,
-		tcReader:        tcReader,
-		timestampOffset: timestampOffset,
+		tcReader:         tcReader,
+		timestampOffset:  timestampOffset,
+		tcLinks:          make(map[string]link.Link),
+		attachedIfaces:   make(map[string]bool),
+		interfaceUpdates: make(chan string, 10),
+		ifacePattern:     pattern,
 	}, nil
 }
 
@@ -111,11 +116,14 @@ func (dp *DNSProcessor) AttachXDP(ifaceName string) error {
 
 // AttachTC attaches the TC program to a network interface
 func (dp *DNSProcessor) AttachTC(ifaceName string) error {
+	if dp.attachedIfaces[ifaceName] {
+		return nil // Already attached
+	}
+
 	iface, err := netlink.LinkByName(ifaceName)
 	if err != nil {
 		return fmt.Errorf("failed to get interface %s: %v", ifaceName, err)
 	}
-	dp.tcIfaceName = ifaceName
 
 	// Create qdisc
 	qdisc := &netlink.GenericQdisc{
@@ -171,8 +179,60 @@ func (dp *DNSProcessor) AttachTC(ifaceName string) error {
 		return fmt.Errorf("failed to attach TC ingress program: %v", err)
 	}
 
+	dp.attachedIfaces[ifaceName] = true
 	log.Printf("TC program attached to interface %s (both ingress and egress)", ifaceName)
 	return nil
+}
+
+// MonitorInterfaces monitors for network interface changes and attaches/detaches eBPF programs accordingly
+func (dp *DNSProcessor) MonitorInterfaces() {
+	// Subscribe to netlink messages for interface changes
+	ch := make(chan netlink.LinkUpdate)
+	done := make(chan struct{})
+	defer close(done)
+
+	if err := netlink.LinkSubscribe(ch, done); err != nil {
+		log.Printf("Failed to subscribe to link updates: %v", err)
+		return
+	}
+
+	log.Println("Started monitoring for interface changes...")
+
+	for update := range ch {
+		iface := update.Link
+		ifaceName := iface.Attrs().Name
+
+		// Skip loopback interfaces
+		if iface.Attrs().Flags&net.FlagLoopback != 0 {
+			continue
+		}
+
+		switch update.Header.Type {
+		case syscall.RTM_NEWLINK:
+			// Interface added or changed
+			if iface.Attrs().Flags&net.FlagUp != 0 && !dp.attachedIfaces[ifaceName] {
+				// Check pattern filter if specified
+				if dp.ifacePattern == nil || dp.ifacePattern.MatchString(ifaceName) {
+					log.Printf("New interface detected: %s", ifaceName)
+					if err := dp.AttachTC(ifaceName); err != nil {
+						log.Printf("Failed to attach to new interface %s: %v", ifaceName, err)
+					} else {
+						log.Printf("Successfully attached to interface: %s", ifaceName)
+					}
+				}
+			}
+		case syscall.RTM_DELLINK:
+			// Interface removed
+			if dp.attachedIfaces[ifaceName] {
+				log.Printf("Interface removed: %s", ifaceName)
+				delete(dp.attachedIfaces, ifaceName)
+				if link, exists := dp.tcLinks[ifaceName]; exists && link != nil {
+					link.Close()
+					delete(dp.tcLinks, ifaceName)
+				}
+			}
+		}
+	}
 }
 
 // ProcessEvents processes DNS events from the ring buffer
@@ -320,7 +380,7 @@ func (dp *DNSProcessor) handleDNSEvent(rawData []byte) {
 		dnsData := event.DNSData[:event.PacketLen]
 		dp.parseDNSPacket(dnsData)
 	} else {
-		fmt.Printf("Larger packet len (%d) than sample size (%s)", event.PacketLen, MaxDnsPacketSize)
+		fmt.Printf("Larger packet len (%d) than sample size (%d)", event.PacketLen, MaxDnsPacketSize)
 	}
 
 	fmt.Println(strings.Repeat("-", 80))
@@ -481,33 +541,22 @@ func (dp *DNSProcessor) Close() {
 	if dp.xdpLink != nil {
 		dp.xdpLink.Close()
 	}
-	if dp.tcLink != nil {
-		dp.tcLink.Close()
-	}
-	// Remove clsact qdisc if we attached it
-	if dp.tcIfaceName != "" {
-		iface, err := netlink.LinkByName(dp.tcIfaceName)
-		if err == nil {
+	// Close all TC links
+	for ifaceName := range dp.attachedIfaces {
+		if link, exists := dp.tcLinks[ifaceName]; exists && link != nil {
+			link.Close()
+		}
+		// Remove clsact qdisc
+		if iface, err := netlink.LinkByName(ifaceName); err == nil {
 			qdisc := &netlink.GenericQdisc{
 				QdiscAttrs: netlink.QdiscAttrs{
 					LinkIndex: iface.Attrs().Index,
-					Handle:    netlink.MakeHandle(0xfff1, 0),
+					Handle:    netlink.MakeHandle(0xffff, 0),
 					Parent:    netlink.HANDLE_CLSACT,
 				},
 				QdiscType: "clsact",
 			}
 			_ = netlink.QdiscDel(qdisc) // ignore error
-
-			netlink.QdiscDel(
-				&netlink.GenericQdisc{
-					QdiscAttrs: netlink.QdiscAttrs{
-						LinkIndex: iface.Attrs().Index,
-						Handle:    netlink.MakeHandle(0xffff, 0),
-						Parent:    netlink.HANDLE_CLSACT,
-					},
-					QdiscType: "clsact",
-				},
-			)
 		}
 	}
 	if dp.xdpCollection != nil {
