@@ -12,14 +12,36 @@ sudo apt-get install -y clang llvm libbpf-dev linux-headers-$(uname -r)
 
 then:
 ```bash
-make clean && go generate && go build -o dns-capture . && sudo ./dns-capture ifName
+make clean && go generate && go build -o dns-capture . && sudo ./dns-capture
+```
+
+Or use the build script:
+```bash
+./build-run.sh
 ```
 
 ## Usage
 
 ```bash
-sudo ./dns-capture ifName
+# Monitor specific interface
+sudo ./dns-capture eth0
+
+# Monitor multiple specific interfaces
+sudo ./dns-capture eth0 wlan0
+
+# Monitor all interfaces (default)
+sudo ./dns-capture
+
+# Monitor interfaces matching a regex pattern
+sudo ./dns-capture -pattern "eth.*|wlan.*"
+
+# Monitor interfaces matching a pattern (no specific interfaces)
+sudo ./dns-capture -pattern "enp.*"
 ```
+
+### Command-line Options
+
+- `-pattern string`: Regex pattern to filter interfaces (e.g., 'eth.*|wlan.*')
 
 ## Misc notes
 

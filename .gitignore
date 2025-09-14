@@ -6,6 +6,7 @@ misc/*
 build-run.sh
 
 # Binary
+ebpf4fun-ring
 dns-capture
 dns-capture_unix
 
