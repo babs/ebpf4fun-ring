@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"os"
 	"os/signal"
@@ -17,6 +18,9 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
+
+	// Borrowed from https://github.com/cosanet/cosanet/blob/master/internal/controller_resolver/
+	"ebpf4fun-ring/internal/controller_resolver"
 )
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror" DnsCaptureXDP ebpf/dns_capture_xdp.c -- -I/usr/include/ -I /usr/include/x86_64-linux-gnu
@@ -144,6 +148,23 @@ func main() {
 			log.Printf("No interface specified, monitoring all interfaces: %v", ifaceNames)
 		}
 	}
+
+	// Controller resolver (borrowed from cosanet)
+	nodename := os.Getenv("NODE_NAME")
+	if nodename == "" {
+		var err error
+		nodename, err = os.Hostname()
+		if err != nil {
+			slog.Error("Failed to get hostname", slog.Any("err", err))
+		}
+	}
+
+	// To be used later for data consolidation
+	_ = controller_resolver.NewResolver(
+		&controller_resolver.ResolverOptions{
+			Nodename: nodename,
+		},
+	)
 
 	// Create DNS processor
 	processor, err := NewDNSProcessor(pattern)
