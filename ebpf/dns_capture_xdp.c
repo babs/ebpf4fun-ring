@@ -101,6 +101,7 @@ int dns_capture_xdp(struct xdp_md *ctx)
 
     // Fill basic event info
     event->timestamp = bpf_ktime_get_ns();
+    event->ifindex = ctx->ingress_ifindex;
     event->ip_version = ip_version;
     event->protocol = transport_proto;
     event->src_port = transport_proto == IPPROTO_UDP ? bpf_ntohs(udp->source) : bpf_ntohs(tcp->source);

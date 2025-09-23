@@ -47,6 +47,9 @@ type PodControllerResolver interface {
 
 	// RemovePodControllerRef removes the cached controller ref for the given Pod.
 	RemovePodControllerRef(pod *corev1.Pod)
+
+	// GetPodByIP returns the cached pod info for the given IP address, if present.
+	GetPodByIP(ip string) (*PodInfo, bool)
 }
 
 // PodControllerRef is a compact reference to the controlling object of a Pod.
@@ -56,6 +59,12 @@ type PodControllerRef struct {
 	Kind       string
 	Namespace  string
 	Name       string
+}
+
+// PodInfo contains minimal pod information for IP-based lookups
+type PodInfo struct {
+	Name      string
+	Namespace string
 }
 
 func getInt(val, def int) int {
@@ -142,6 +151,11 @@ func NewResolver(opts *ResolverOptions) PodControllerResolver {
 		podCache: cache.New(
 			cache.AsLRU[string, *PodControllerRef](lru.WithCapacity(getInt(opts.PodCacheCapacity, 500))),
 		),
+
+		// IP cache for pod IP to pod mapping
+		ipCache: cache.New(
+			cache.AsLRU[string, *PodInfo](lru.WithCapacity(getInt(opts.PodCacheCapacity, 1500))),
+		),
 	}
 
 	// Create a shared informer factory for all namespaces and the pod informer
@@ -169,6 +183,10 @@ func NewResolver(opts *ResolverOptions) PodControllerResolver {
 					slog.Any("err", err),
 				)
 			}
+			// Index pod by IP
+			if pod.Status.PodIP != "" {
+				r.ipCache.Set(pod.Status.PodIP, &PodInfo{Name: pod.Name, Namespace: pod.Namespace})
+			}
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			oldPod := oldObj.(*corev1.Pod)
@@ -190,10 +208,21 @@ func NewResolver(opts *ResolverOptions) PodControllerResolver {
 					}
 				}
 			}
+			// Update IP index
+			if oldPod.Status.PodIP != "" {
+				r.ipCache.Delete(oldPod.Status.PodIP)
+			}
+			if pod.Status.PodIP != "" {
+				r.ipCache.Set(pod.Status.PodIP, &PodInfo{Name: pod.Name, Namespace: pod.Namespace})
+			}
 		},
 		DeleteFunc: func(obj interface{}) {
 			pod := obj.(*corev1.Pod)
 			r.RemovePodControllerRef(pod)
+			// Remove from IP cache
+			if pod.Status.PodIP != "" {
+				r.ipCache.Delete(pod.Status.PodIP)
+			}
 		},
 	})
 
@@ -211,6 +240,7 @@ type resolver struct {
 	client      kubernetes.Interface
 	parentCache *cache.Cache[string, *PodControllerRef]
 	podCache    *cache.Cache[string, *PodControllerRef]
+	ipCache     *cache.Cache[string, *PodInfo]
 }
 
 // RemovePodControllerRef evicts a cached entry for the given Pod from the pod cache.
@@ -219,6 +249,11 @@ func (r *resolver) RemovePodControllerRef(pod *corev1.Pod) {
 		return
 	}
 	r.podCache.Delete(generatePodCacheKey(pod))
+}
+
+// GetPodByIP returns the cached pod info for the given IP address, if present.
+func (r *resolver) GetPodByIP(ip string) (*PodInfo, bool) {
+	return r.ipCache.Get(ip)
 }
 
 func generateCacheKey(namespace string, ownerRef metav1.OwnerReference) string {

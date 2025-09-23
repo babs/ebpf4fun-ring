@@ -26,3 +26,7 @@ func (n *noopResolver) ResolvePodControllerRef(pod *corev1.Pod) (*PodControllerR
 func (n *noopResolver) RemovePodControllerRef(pod *corev1.Pod) {
 	// noop: nothing to remove from cache
 }
+
+func (n *noopResolver) GetPodByIP(ip string) (*PodInfo, bool) {
+	return nil, false
+}
