@@ -18,6 +18,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
+	"go.uber.org/zap"
 
 	// Borrowed from https://github.com/cosanet/cosanet/blob/master/internal/controller_resolver/
 	"ebpf4fun-ring/internal/controller_resolver"
@@ -27,11 +28,30 @@ import (
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror" DnsCaptureTC ebpf/dns_capture_tc.c -- -I/usr/include/ -I /usr/include/x86_64-linux-gnu
 
 const (
-	MaxDnsPacketSize = 1496
+	// MaxDnsPacketSize = 1496
+	MaxDnsPacketSize = 1500
 	// MaxDnsPacketSize = 4996
 	ProtocolUDP = 17
 	ProtocolTCP = 6
 )
+
+var (
+	Version        = "v0.0.0"
+	CommitHash     = "0000000"
+	BuildTimestamp = "1970-01-01T00:00:00"
+	Builder        = "go version go1.xx.y os/platform"
+	ProjectURL     = "https://github.com/babs/ebpf4fun-ring"
+)
+
+// cliOpts holds command-line options
+type cliOpts struct {
+	ifacePattern   string
+	domainContains string
+	verbose        bool
+	logDev         bool
+	logStacktraces bool
+	logLevel       string
+}
 
 // DNSHeader represents DNS header structure
 type DNSHeader struct {
@@ -52,8 +72,9 @@ type DNSEvent struct {
 	DstPort   uint16                 // offset 4
 	PacketLen uint16                 // offset 6
 	Timestamp uint64                 // offset 8
-	Addr      [32]byte               // offset 16 (union as raw bytes)
-	DNSData   [MaxDnsPacketSize]byte // offset 48
+	IfIndex   uint32                 // offset 16
+	Addr      [32]byte               // offset 20 (union as raw bytes)
+	DNSData   [MaxDnsPacketSize]byte // offset 52
 }
 
 // DNSProcessor handles DNS packet processing
@@ -63,11 +84,14 @@ type DNSProcessor struct {
 	xdpReader        *ringbuf.Reader
 	tcReader         *ringbuf.Reader
 	xdpLink          link.Link
-	tcLinks          map[string]link.Link // Map of interface name to TC link
-	timestampOffset  int64                // Offset to convert eBPF boot-time to Unix time
-	attachedIfaces   map[string]bool      // Track attached interfaces
-	interfaceUpdates chan string          // Channel for interface updates
-	ifacePattern     *regexp.Regexp       // Regex pattern for interface filtering
+	tcLinks          map[string]link.Link                      // Map of interface name to TC link
+	timestampOffset  int64                                     // Offset to convert eBPF boot-time to Unix time
+	attachedIfaces   map[string]bool                           // Track attached interfaces
+	interfaceUpdates chan string                               // Channel for interface updates
+	ifacePattern     *regexp.Regexp                            // Regex pattern for interface filtering
+	domainFilters    []string                                  // List of strings to filter domains containing these substrings
+	verbose          bool                                      // Enable verbose output
+	podResolver      controller_resolver.PodControllerResolver // Pod resolver for IP to pod mapping
 }
 
 // getSystemUptime reads the system uptime from /proc/uptime
@@ -96,24 +120,61 @@ func intToIP(ip uint32) net.IP {
 	return net.IPv4(byte(ip), byte(ip>>8), byte(ip>>16), byte(ip>>24))
 }
 
+var logger *zap.Logger
+
 func main() {
-	var ifacePattern = flag.String("pattern", "", "Regex pattern to filter interfaces (e.g., 'eth.*|wlan.*')")
+	var opts cliOpts
+	flag.StringVar(&opts.ifacePattern, "if-pattern", "", "Regex pattern to filter interfaces (e.g., 'eth.*|wlan.*')")
+	flag.StringVar(&opts.domainContains, "domain-contains", "", "Comma-separated list of strings to filter domains containing these substrings (e.g., 'google,facebook')")
+	flag.BoolVar(&opts.verbose, "verbose", false, "Enable verbose output with detailed DNS packet information")
+	flag.BoolVar(&opts.logDev, "log-dev", false, "Enable development logging mode")
+	flag.BoolVar(&opts.logStacktraces, "log-stacktraces", false, "Include stacktraces in logs")
+	flag.StringVar(&opts.logLevel, "log-level", "info", "Set log level (debug, info, warn, error)")
 	flag.Parse()
+	args := flag.Args()
+
+	initLog(&opts)
+	defer logger.Sync()
+
+	var domainFilters []string
+	if opts.domainContains != "" {
+		domainFilters = strings.Split(opts.domainContains, ",")
+		// Trim spaces from each filter
+		for i, filter := range domainFilters {
+			domainFilters[i] = strings.TrimSpace(filter)
+		}
+	}
+
+	logger.Info("Build Info",
+		zap.String("version", Version),
+		zap.String("commit_hash", CommitHash),
+		zap.String("build_timestamp", BuildTimestamp),
+		zap.String("builder", Builder),
+		zap.String("project_url", ProjectURL),
+	)
+	logger.Info("Starting",
+		zap.String("iface_pattern", opts.ifacePattern),
+		zap.String("domain_contains", opts.domainContains),
+		zap.Bool("verbose", opts.verbose),
+		zap.Bool("log_dev", opts.logDev),
+		zap.Bool("log_stacktraces", opts.logStacktraces),
+		zap.String("log_level", opts.logLevel),
+		zap.Strings("interfaces", args),
+	)
 
 	var ifaceNames []string
 	var pattern *regexp.Regexp
 	var err error
 
 	// Compile regex pattern if provided
-	if *ifacePattern != "" {
-		pattern, err = regexp.Compile(*ifacePattern)
+	if opts.ifacePattern != "" {
+		pattern, err = regexp.Compile(opts.ifacePattern)
 		if err != nil {
 			log.Fatalf("Invalid regex pattern: %v", err)
 		}
 	}
 
 	// Check for positional interface arguments
-	args := flag.Args()
 	if len(args) > 0 {
 		// Specific interfaces provided
 		ifaceNames = args
@@ -136,14 +197,14 @@ func main() {
 
 		if len(ifaceNames) == 0 {
 			if pattern != nil {
-				log.Fatalf("No interfaces found matching pattern '%s'", *ifacePattern)
+				log.Fatalf("No interfaces found matching pattern '%s'", opts.ifacePattern)
 			} else {
 				log.Fatal("No suitable network interfaces found")
 			}
 		}
 
 		if pattern != nil {
-			log.Printf("Monitoring interfaces matching pattern '%s': %v", *ifacePattern, ifaceNames)
+			log.Printf("Monitoring interfaces matching pattern '%s': %v", opts.ifacePattern, ifaceNames)
 		} else {
 			log.Printf("No interface specified, monitoring all interfaces: %v", ifaceNames)
 		}
@@ -160,14 +221,14 @@ func main() {
 	}
 
 	// To be used later for data consolidation
-	_ = controller_resolver.NewResolver(
+	podResolver := controller_resolver.NewResolver(
 		&controller_resolver.ResolverOptions{
 			Nodename: nodename,
 		},
 	)
 
 	// Create DNS processor
-	processor, err := NewDNSProcessor(pattern)
+	processor, err := NewDNSProcessor(pattern, domainFilters, opts.verbose, podResolver)
 	if err != nil {
 		log.Fatalf("Failed to create DNS processor: %v", err)
 	}

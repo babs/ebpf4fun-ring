@@ -23,6 +23,7 @@ struct dns_event {
     __u16 dst_port;
     __u16 packet_len;
     __u64 timestamp;
+    __u32 ifindex;    // Interface index
     union {
         struct {
             __u32 src_ip;

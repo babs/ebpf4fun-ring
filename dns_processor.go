@@ -19,10 +19,14 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/miekg/dns"
 	"github.com/vishvananda/netlink"
+	"go.uber.org/zap"
+
+	// Borrowed from https://github.com/cosanet/cosanet/blob/master/internal/controller_resolver/
+	"ebpf4fun-ring/internal/controller_resolver"
 )
 
 // NewDNSProcessor creates a new DNS processor
-func NewDNSProcessor(pattern *regexp.Regexp) (*DNSProcessor, error) {
+func NewDNSProcessor(pattern *regexp.Regexp, domainFilters []string, verbose bool, podResolver controller_resolver.PodControllerResolver) (*DNSProcessor, error) {
 	// Remove memory limit for eBPF
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return nil, fmt.Errorf("failed to remove memory limit: %v", err)
@@ -91,6 +95,9 @@ func NewDNSProcessor(pattern *regexp.Regexp) (*DNSProcessor, error) {
 		attachedIfaces:   make(map[string]bool),
 		interfaceUpdates: make(chan string, 10),
 		ifacePattern:     pattern,
+		domainFilters:    domainFilters,
+		verbose:          verbose,
+		podResolver:      podResolver,
 	}, nil
 }
 
@@ -322,6 +329,10 @@ func (dp *DNSProcessor) handleDNSEvent(rawData []byte) {
 		event.Timestamp = binary.LittleEndian.Uint64(rawData[offset : offset+8])
 		offset += 8
 	}
+	if offset+4 <= dataLen {
+		event.IfIndex = binary.LittleEndian.Uint32(rawData[offset : offset+4])
+		offset += 4
+	}
 	if offset+32 <= dataLen {
 		copy(event.Addr[:], rawData[offset:offset+32])
 		offset += 32
@@ -363,31 +374,27 @@ func (dp *DNSProcessor) handleDNSEvent(rawData []byte) {
 
 	timestamp := time.Unix(0, int64(event.Timestamp+uint64(dp.timestampOffset)))
 
-	fmt.Printf("[%s] IPv%d %s %s:%d -> %s:%d (%d bytes)",
-		timestamp.Format("2006-01-02 15:04:05.000"),
-		event.IPVersion,
-		protocol,
-		srcIP, event.SrcPort,
-		dstIP, event.DstPort,
-		event.PacketLen)
-
 	if dataLen < int(unsafe.Sizeof(DNSEvent{})) {
 		fmt.Printf(" [PARTIAL RECORD: %d/%d bytes]", dataLen, int(unsafe.Sizeof(DNSEvent{})))
 	}
-	fmt.Println()
 
 	if event.PacketLen > 0 && event.PacketLen <= MaxDnsPacketSize {
 		dnsData := event.DNSData[:event.PacketLen]
-		dp.parseDNSPacket(dnsData)
+		dp.parseDNSPacket(dnsData, &event, srcIP, dstIP)
 	} else {
-		fmt.Printf("Larger packet len (%d) than sample size (%d)", event.PacketLen, MaxDnsPacketSize)
+		// Only log oversized packets
+		fmt.Printf("[%s] IPv%d %s %s:%d -> %s:%d (%d bytes) - OVERSIZED PACKET\n",
+			timestamp.Format("2006-01-02 15:04:05.000"),
+			event.IPVersion,
+			protocol,
+			srcIP, event.SrcPort,
+			dstIP, event.DstPort,
+			event.PacketLen)
 	}
-
-	fmt.Println(strings.Repeat("-", 80))
 }
 
 // parseDNSPacket attempts to parse basic DNS packet information
-func (dp *DNSProcessor) parseDNSPacket(data []byte) {
+func (dp *DNSProcessor) parseDNSPacket(data []byte, event *DNSEvent, srcIP, dstIP string) {
 	if len(data) < 12 {
 		fmt.Println("DNS packet too short")
 		return
@@ -403,73 +410,138 @@ func (dp *DNSProcessor) parseDNSPacket(data []byte) {
 		return
 	}
 
-	// Display basic DNS information
-	fmt.Printf("  DNS ID: %d, Type: %s, Opcode: %s, RCode: %s\n",
-		msg.Id,
-		map[bool]string{true: "Response", false: "Query"}[msg.Response],
-		dns.OpcodeToString[msg.Opcode],
-		dns.RcodeToString[msg.Rcode])
-
-	fmt.Printf("  Questions: %d, Answers: %d, Authority: %d, Additional: %d\n",
-		len(msg.Question), len(msg.Answer), len(msg.Ns), len(msg.Extra))
-
-	// Display questions
-	if len(msg.Question) > 0 {
-		var queries []string
+	// Apply domain filtering if filters are specified
+	if len(dp.domainFilters) > 0 {
+		matches := false
 		for _, q := range msg.Question {
-			queries = append(queries, fmt.Sprintf("%s (%s)", q.Name, dns.TypeToString[q.Qtype]))
+			domain := strings.ToLower(q.Name)
+			for _, filter := range dp.domainFilters {
+				if strings.Contains(domain, strings.ToLower(filter)) {
+					matches = true
+					break
+				}
+			}
+			if matches {
+				break
+			}
 		}
-		fmt.Printf("  Queries: %s\n", strings.Join(queries, ", "))
+		if !matches {
+			// No domains match the filters, skip this packet
+			return
+		}
 	}
 
-	// Display answers
-	if msg.Response && len(msg.Answer) > 0 {
-		var answers []string
-		for _, rr := range msg.Answer {
-			answers = append(answers, rr.String())
+	// Add log here
+	var srcPodName, dstPodName, srcPodNamespace, dstPodNamespace string
+	if dp.podResolver != nil {
+		if pod, ok := dp.podResolver.GetPodByIP(srcIP); ok {
+			srcPodName = pod.Name
+			srcPodNamespace = pod.Namespace
 		}
-		fmt.Printf("  Answers: %s\n", strings.Join(answers, ", "))
+		if pod, ok := dp.podResolver.GetPodByIP(dstIP); ok {
+			dstPodName = pod.Name
+			dstPodNamespace = pod.Namespace
+		}
 	}
 
-	// Display authority records
-	if msg.Response && len(msg.Ns) > 0 {
-		var authorities []string
-		for _, rr := range msg.Ns {
-			authorities = append(authorities, rr.String())
+	// Resolve interface name from index
+	var ifaceName string
+	if event.IfIndex > 0 {
+		if iface, err := net.InterfaceByIndex(int(event.IfIndex)); err == nil {
+			ifaceName = iface.Name
 		}
-		fmt.Printf("  Authority: %s\n", strings.Join(authorities, ", "))
 	}
 
-	// Display additional records
-	if len(msg.Extra) > 0 {
-		var additional []string
-		for _, rr := range msg.Extra {
-			additional = append(additional, rr.String())
-		}
-		fmt.Printf("  Additional: %s\n", strings.Join(additional, ", "))
+	var questions []string
+	for _, q := range msg.Question {
+		questions = append(questions, fmt.Sprintf("%s %s", q.Name, dns.TypeToString[q.Qtype]))
 	}
+	questionStr := strings.Join(questions, "; ")
 
-	// Show hex dump of all captured data (limited)
-	hexDump := make([]string, 0)
-	dumpSize := len(data)
-	dumpstep := 32
-	maxdumpsize := 256
-	if dumpSize > maxdumpsize {
-		dumpSize = maxdumpsize
-	}
-	for i := 0; i < dumpSize; i += dumpstep {
-		end := i + dumpstep
-		if end > dumpSize {
-			end = dumpSize
+	logger.Info("DNS packet",
+		zap.String("source_ip", srcIP),
+		zap.String("dest_ip", dstIP),
+		zap.Uint16("source_port", event.SrcPort),
+		zap.Uint16("dest_port", event.DstPort),
+		zap.Bool("is_response", msg.Response),
+		zap.Uint16("dns_id", msg.Id),
+		zap.String("questions", questionStr),
+		zap.String("interface", ifaceName),
+		zap.String("src_pod_name", srcPodName),
+		zap.String("src_pod_namespace", srcPodNamespace),
+		zap.String("dst_pod_name", dstPodName),
+		zap.String("dst_pod_namespace", dstPodNamespace),
+	)
+
+	// Display basic DNS information
+	if dp.verbose {
+		fmt.Printf("  DNS ID: %d, Type: %s, Opcode: %s, RCode: %s\n",
+			msg.Id,
+			map[bool]string{true: "Response", false: "Query"}[msg.Response],
+			dns.OpcodeToString[msg.Opcode],
+			dns.RcodeToString[msg.Rcode])
+
+		fmt.Printf("  Questions: %d, Answers: %d, Authority: %d, Additional: %d\n",
+			len(msg.Question), len(msg.Answer), len(msg.Ns), len(msg.Extra))
+
+		// Display questions
+		if len(msg.Question) > 0 {
+			var queries []string
+			for _, q := range msg.Question {
+				queries = append(queries, fmt.Sprintf("%s (%s)", q.Name, dns.TypeToString[q.Qtype]))
+			}
+			fmt.Printf("  Queries: %s\n", strings.Join(queries, ", "))
 		}
-		hexDump = append(hexDump, fmt.Sprintf("  %04x: % x", i, data[i:end]))
-	}
-	fmt.Println("  Hex dump:")
-	for _, line := range hexDump {
-		fmt.Println(line)
-	}
-	if len(data) > maxdumpsize {
-		fmt.Printf("  ... (%d more bytes)\n", len(data)-maxdumpsize)
+
+		// Display answers
+		if msg.Response && len(msg.Answer) > 0 {
+			var answers []string
+			for _, rr := range msg.Answer {
+				answers = append(answers, rr.String())
+			}
+			fmt.Printf("  Answers: %s\n", strings.Join(answers, ", "))
+		}
+
+		// Display authority records
+		if msg.Response && len(msg.Ns) > 0 {
+			var authorities []string
+			for _, rr := range msg.Ns {
+				authorities = append(authorities, rr.String())
+			}
+			fmt.Printf("  Authority: %s\n", strings.Join(authorities, ", "))
+		}
+
+		// Display additional records
+		if len(msg.Extra) > 0 {
+			var additional []string
+			for _, rr := range msg.Extra {
+				additional = append(additional, rr.String())
+			}
+			fmt.Printf("  Additional: %s\n", strings.Join(additional, ", "))
+		}
+
+		// Show hex dump of all captured data (limited)
+		hexDump := make([]string, 0)
+		dumpSize := len(data)
+		dumpstep := 32
+		maxdumpsize := 256
+		if dumpSize > maxdumpsize {
+			dumpSize = maxdumpsize
+		}
+		for i := 0; i < dumpSize; i += dumpstep {
+			end := i + dumpstep
+			if end > dumpSize {
+				end = dumpSize
+			}
+			hexDump = append(hexDump, fmt.Sprintf("  %04x: % x", i, data[i:end]))
+		}
+		fmt.Println("  Hex dump:")
+		for _, line := range hexDump {
+			fmt.Println(line)
+		}
+		if len(data) > maxdumpsize {
+			fmt.Printf("  ... (%d more bytes)\n", len(data)-maxdumpsize)
+		}
 	}
 }
 

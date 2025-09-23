@@ -121,6 +121,7 @@ int dns_capture_tc(struct __sk_buff *skb) {
     event->src_port = src_port;
     event->dst_port = dst_port;
     event->packet_len = dns_payload_len;
+    event->ifindex = skb->ifindex;
 
     if (ip_version == 4 && iph) {
         event->addr.ipv4.src_ip = iph->saddr;
