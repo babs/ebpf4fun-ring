@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"log"
@@ -404,9 +405,18 @@ func (dp *DNSProcessor) parseDNSPacket(data []byte, event *DNSEvent, srcIP, dstI
 	msg := new(dns.Msg)
 	err := msg.Unpack(data)
 	if err != nil {
-		fmt.Printf("Error parsing DNS packet with miekg/dns: %v\n", err)
+		encodedPacket := base64.StdEncoding.EncodeToString(data)
+		logger.Warn("DNS parsing failure",
+			zap.Error(err),
+			zap.String("base64_packet", encodedPacket),
+			zap.Int("packet_length", len(data)),
+		)
+
 		// Fallback to basic header parsing
-		dp.parseDNSHeaderFallback(data)
+		if dp.verbose {
+			dp.parseDNSHeaderFallback(data)
+		}
+
 		return
 	}
 
