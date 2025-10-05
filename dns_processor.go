@@ -443,14 +443,23 @@ func (dp *DNSProcessor) parseDNSPacket(data []byte, event *DNSEvent, srcIP, dstI
 
 	// Add log here
 	var srcPodName, dstPodName, srcPodNamespace, dstPodNamespace string
+	var srcPodControllerName, dstPodControllerName, srcPodControllerKind, dstPodControllerKind string
 	if dp.podResolver != nil {
 		if pod, ok := dp.podResolver.GetPodByIP(srcIP); ok {
 			srcPodName = pod.Name
 			srcPodNamespace = pod.Namespace
+			if ctrlref, found := dp.podResolver.GetControllerForUid(pod.UID); found {
+				srcPodControllerKind = ctrlref.Kind
+				srcPodControllerName = ctrlref.Name
+			}
 		}
 		if pod, ok := dp.podResolver.GetPodByIP(dstIP); ok {
 			dstPodName = pod.Name
 			dstPodNamespace = pod.Namespace
+			if ctrlref, found := dp.podResolver.GetControllerForUid(pod.UID); found {
+				dstPodControllerKind = ctrlref.Kind
+				dstPodControllerName = ctrlref.Name
+			}
 		}
 	}
 
@@ -479,8 +488,12 @@ func (dp *DNSProcessor) parseDNSPacket(data []byte, event *DNSEvent, srcIP, dstI
 		zap.String("interface", ifaceName),
 		zap.String("src_pod_name", srcPodName),
 		zap.String("src_pod_namespace", srcPodNamespace),
+		zap.String("src_pod_controller_kind", srcPodControllerKind),
+		zap.String("src_pod_controller_name", srcPodControllerName),
 		zap.String("dst_pod_name", dstPodName),
 		zap.String("dst_pod_namespace", dstPodNamespace),
+		zap.String("dst_pod_controller_kind", dstPodControllerKind),
+		zap.String("dst_pod_controller_name", dstPodControllerName),
 	)
 
 	// Display basic DNS information

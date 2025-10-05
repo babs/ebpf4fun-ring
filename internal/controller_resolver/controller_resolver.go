@@ -65,6 +65,7 @@ type PodControllerRef struct {
 type PodInfo struct {
 	Name      string
 	Namespace string
+	UID       string
 }
 
 func getInt(val, def int) int {
@@ -163,7 +164,7 @@ func NewResolver(opts *ResolverOptions) PodControllerResolver {
 	podInformer := factory.Core().V1().Pods().Informer()
 
 	// If node name is missing, don't filter on node
-	allNodes := opts.Nodename != ""
+	allNodes := opts.Nodename == ""
 
 	podInformer.AddEventHandler(kubecache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
@@ -185,7 +186,7 @@ func NewResolver(opts *ResolverOptions) PodControllerResolver {
 			}
 			// Index pod by IP
 			if pod.Status.PodIP != "" {
-				r.ipCache.Set(pod.Status.PodIP, &PodInfo{Name: pod.Name, Namespace: pod.Namespace})
+				r.ipCache.Set(pod.Status.PodIP, &PodInfo{Name: pod.Name, Namespace: pod.Namespace, UID: string(pod.GetUID())})
 			}
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
@@ -213,7 +214,7 @@ func NewResolver(opts *ResolverOptions) PodControllerResolver {
 				r.ipCache.Delete(oldPod.Status.PodIP)
 			}
 			if pod.Status.PodIP != "" {
-				r.ipCache.Set(pod.Status.PodIP, &PodInfo{Name: pod.Name, Namespace: pod.Namespace})
+				r.ipCache.Set(pod.Status.PodIP, &PodInfo{Name: pod.Name, Namespace: pod.Namespace, UID: string(pod.GetUID())})
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
