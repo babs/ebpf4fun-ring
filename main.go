@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"log/slog"
 	"net"
 	"os"
 	"os/signal"
@@ -211,19 +210,13 @@ func main() {
 	}
 
 	// Controller resolver (borrowed from cosanet)
-	nodename := os.Getenv("NODE_NAME")
-	if nodename == "" {
-		var err error
-		nodename, err = os.Hostname()
-		if err != nil {
-			slog.Error("Failed to get hostname", slog.Any("err", err))
-		}
-	}
 
 	// To be used later for data consolidation
 	podResolver := controller_resolver.NewResolver(
 		&controller_resolver.ResolverOptions{
-			Nodename: nodename,
+			Nodename:            "",
+			ParentCacheCapacity: 2500,
+			PodCacheCapacity:    5000,
 		},
 	)
 
